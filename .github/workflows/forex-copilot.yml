@@ -3,10 +3,8 @@ name: Forex Copilot Analysis
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-    paths:
-      - forex_data.csv
+    branches: [main]
+    paths: [forex_data.csv]
 
 permissions:
   contents: write
@@ -48,24 +46,20 @@ jobs:
 
           echo "$PROMPT" > /tmp/prompt.txt
 
-          jq -n \
-            --rawfile prompt /tmp/prompt.txt \
-            '{
-              model: "gpt-4o",
-              messages: [
-                { role: "user", content: $prompt }
-              ],
-              max_tokens: 200,
-              temperature: 0.2
-            }' > /tmp/payload.json
+          jq -n --rawfile prompt /tmp/prompt.txt '{
+            model: "gpt-4o",
+            messages: [ { role: "user", content: $prompt } ],
+            max_tokens: 200,
+            temperature: 0.2
+          }' > /tmp/payload.json
 
       - name: Create Copilot app token
         id: app_token
-        uses: actions/create-github-app-token@v1
+        uses: tibdex/github-app-token@v2
         with:
-          app-id: ${{ secrets.COPILOT_APP_ID }}
-          private-key: ${{ secrets.COPILOT_APP_PRIVATE_KEY }}
-          installation-id: ${{ secrets.COPILOT_INSTALLATION_ID }}
+          app_id: ${{ secrets.COPILOT_APP_ID }}
+          private_key: ${{ secrets.COPILOT_APP_PRIVATE_KEY }}
+          installation_id: ${{ secrets.COPILOT_INSTALLATION_ID }}
 
       - name: Call GitHub Copilot Chat API
         id: copilot
