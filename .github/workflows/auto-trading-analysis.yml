@@ -6,15 +6,6 @@ on:
       - 'forex_data.csv'
   workflow_dispatch:
     inputs:
-      model:
-        description: 'AI model to use for analysis'
-        required: false
-        default: 'claude-opus-4-5'
-        type: choice
-        options:
-          - claude-opus-4-5
-          - claude-sonnet-4-5
-          - gpt-4o
       create_issue:
         description: 'Create GitHub Issue with analysis'
         required: false
@@ -23,7 +14,7 @@ on:
       send_telegram:
         description: 'Send Telegram notification'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
 
 concurrency:
@@ -57,18 +48,10 @@ jobs:
 
       - name: Run Trading Analysis
         id: analysis
-        env:
-          COPILOT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ANALYSIS_MODEL: ${{ github.event.inputs.model || 'claude-opus-4-5' }}
-          VERIFICATION_MODEL: 'claude-sonnet-4-5'
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           python scripts/analyze_trading.py \
             --csv forex_data.csv \
-            --output analysis_result.json \
-            --model "$ANALYSIS_MODEL" \
-            --verify-model "$VERIFICATION_MODEL"
+            --output analysis_result.json
 
       - name: Generate Report
         id: report
@@ -93,10 +76,10 @@ jobs:
             --report ANALYSIS_REPORT.md
 
       - name: Send Telegram Notification
-        if: ${{ github.event.inputs.send_telegram == 'true' && secrets.TELEGRAM_BOT_TOKEN != '' }}
+        if: ${{ github.event.inputs.send_telegram != 'false' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: "1823341851"
           ANALYSIS_FILE: analysis_result.json
         run: |
           python scripts/notify_telegram.py \

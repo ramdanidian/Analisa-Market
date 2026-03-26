@@ -1,41 +1,31 @@
 #!/usr/bin/env python3
 """
-analyze_trading.py - Core trading analysis using GitHub Copilot AI models.
+analyze_trading.py - Self-contained technical analysis engine.
 
-Reads forex_data.csv, builds a structured prompt, calls the GitHub Copilot
-chat completions API (OpenAI-compatible), and writes a JSON result file.
+Computes RSI, EMA, MACD, Bollinger Bands, ATR, and Support/Resistance
+levels directly from forex_data.csv candle data.
+No external AI API required — all analysis is performed in Python.
 
 Usage:
     python scripts/analyze_trading.py \
         --csv forex_data.csv \
-        --output analysis_result.json \
-        --model claude-opus-4-5 \
-        --verify-model claude-sonnet-4-5
+        --output analysis_result.json
 """
 
 import argparse
 import json
-import os
 import sys
-import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
-import requests
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-COPILOT_API_URL = "https://api.githubcopilot.com/chat/completions"
-MAX_CANDLES_IN_PROMPT = 50  # keep prompt size manageable
-
 
 # ---------------------------------------------------------------------------
 # CSV Parsing
 # ---------------------------------------------------------------------------
 
 def parse_csv(csv_path: str) -> dict:
-    """Parse the forex_data.csv sections into a structured dict."""
+    """Parse forex_data.csv sections into a structured dict."""
     with open(csv_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
@@ -56,7 +46,6 @@ def parse_csv(csv_path: str) -> dict:
     for line in lines:
         line = line.rstrip("\n")
 
-        # --- Section detection ---
         if line.startswith("# MARKET DATA ANALYSIS"):
             data["metadata"]["report_time"] = line.split(" - ")[-1].strip()
             continue
@@ -70,40 +59,25 @@ def parse_csv(csv_path: str) -> dict:
             data["metadata"]["last_update"] = line.split(":", 1)[1].strip()
             continue
         if "# PAIR INFORMATION" in line:
-            section = "pair_info"
-            headers = []
-            continue
+            section = "pair_info"; headers = []; continue
         if "# ACTIVE POSITIONS" in line:
-            section = "active_positions"
-            headers = []
-            continue
+            section = "active_positions"; headers = []; continue
         if "# PENDING ORDERS" in line:
-            section = "pending_orders"
-            headers = []
-            continue
+            section = "pending_orders"; headers = []; continue
         if "# LAST 5 CLOSED DEALS" in line:
-            section = "closed_deals"
-            headers = []
-            continue
+            section = "closed_deals"; headers = []; continue
         if "# M5 CANDLES" in line:
-            section = "m5_candles"
-            headers = []
-            continue
+            section = "m5_candles"; headers = []; continue
         if "# M15 CANDLES" in line:
-            section = "m15_candles"
-            headers = []
-            continue
+            section = "m15_candles"; headers = []; continue
         if "# H1 CANDLES" in line:
-            section = "h1_candles"
-            headers = []
-            continue
+            section = "h1_candles"; headers = []; continue
         if line.startswith("# "):
-            continue  # skip other comment lines
-
-        if not line.strip() or line.strip() == "":
             continue
 
-        # --- Data rows ---
+        if not line.strip():
+            continue
+
         parts = [p.strip() for p in line.split(",")]
 
         if section == "pair_info":
@@ -114,7 +88,6 @@ def parse_csv(csv_path: str) -> dict:
         if section in ("active_positions", "pending_orders", "closed_deals",
                        "m5_candles", "m15_candles", "h1_candles"):
             if not headers:
-                # Deduplicate headers by appending _2, _3 for repeats
                 seen: dict = {}
                 deduped = []
                 for h in parts:
@@ -133,269 +106,595 @@ def parse_csv(csv_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder
+# DataFrame helpers
 # ---------------------------------------------------------------------------
 
-def build_analysis_prompt(data: dict) -> str:
-    """Build a detailed analysis prompt from parsed CSV data."""
-    symbol = data["metadata"].get("symbol", "XAUUSD")
-    report_time = data["metadata"].get("report_time", "Unknown")
-    pair_info = data["pair_info"]
+def candles_to_df(candles: list) -> pd.DataFrame:
+    """Convert candle list to a typed DataFrame (oldest row last → ascending)."""
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(candles)
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    # CSV is newest-first; reverse to oldest-first for indicator math
+    return df.iloc[::-1].reset_index(drop=True)
 
-    bid = pair_info.get("Current Bid", "N/A")
-    ask = pair_info.get("Current Ask", "N/A")
 
-    # Active positions
-    active = data["active_positions"]
-    active_text = "No active positions." if not active else "\n".join(
-        f"  - Ticket {p.get('Ticket','?')}: {p.get('Type','?')} {p.get('Volume','?')} lots @ {p.get('Price','?')}, SL={p.get('S/L','?')}, TP={p.get('T/P','?')}"
-        for p in active
+# ---------------------------------------------------------------------------
+# Technical Indicators
+# ---------------------------------------------------------------------------
+
+def ema_series(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def rsi_series(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50)
+
+
+def macd_series(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = ema_series(series, fast)
+    ema_slow = ema_series(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema_series(macd_line, signal)
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def bollinger_series(series: pd.Series, period=20, std_dev=2.0):
+    period = min(period, len(series))
+    sma = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    return sma + std_dev * std, sma, sma - std_dev * std
+
+
+def atr_series(df: pd.DataFrame, period=14) -> pd.Series:
+    high, low, prev_close = df["High"], df["Low"], df["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
+
+
+def find_support_resistance(df: pd.DataFrame, lookback: int = 30):
+    """Return (support, resistance) from recent swing highs/lows."""
+    recent = df.tail(lookback)
+    resistance = float(recent["High"].max())
+    support = float(recent["Low"].min())
+    # Tighten using rolling swing points
+    rolling_max = recent["High"].rolling(3, center=True).max()
+    rolling_min = recent["Low"].rolling(3, center=True).min()
+    swing_highs = recent["High"][recent["High"] == rolling_max]
+    swing_lows = recent["Low"][recent["Low"] == rolling_min]
+    if len(swing_highs) >= 2:
+        resistance = float(swing_highs.mean())
+    if len(swing_lows) >= 2:
+        support = float(swing_lows.mean())
+    return round(support, 3), round(resistance, 3)
+
+
+# ---------------------------------------------------------------------------
+# Single Timeframe Analysis
+# ---------------------------------------------------------------------------
+
+def analyze_timeframe(candles: list, label: str) -> dict:
+    """Full technical analysis for one timeframe. Returns enriched dict."""
+    df = candles_to_df(candles)
+    if df.empty or len(df) < 5:
+        return {
+            "trend": "SIDEWAYS", "strength": 0,
+            "key_levels": {"support": 0.0, "resistance": 0.0},
+            "last_close": 0.0, "signals": ["Insufficient data"],
+            "commentary": f"Not enough {label} candle data.",
+            "_rsi": 50.0, "_macd_bull": False, "_ema9": 0.0, "_ema21": 0.0,
+            "_ema50": 0.0, "_atr": 0.0, "_bb_upper": 0.0, "_bb_lower": 0.0,
+        }
+
+    close = df["Close"]
+    last_close = float(close.iloc[-1])
+    n = len(df)
+
+    ema9 = ema_series(close, min(9, n))
+    ema21 = ema_series(close, min(21, n))
+    ema50 = ema_series(close, min(50, n))
+    rsi_vals = rsi_series(close, min(14, n - 1))
+    macd_line, signal_line, histogram = macd_series(close)
+    bb_upper, bb_mid, bb_lower = bollinger_series(close, min(20, n))
+    atr_vals = atr_series(df, min(14, n - 1))
+
+    cur_rsi = float(rsi_vals.iloc[-1])
+    cur_ema9 = float(ema9.iloc[-1])
+    cur_ema21 = float(ema21.iloc[-1])
+    cur_ema50 = float(ema50.iloc[-1])
+    cur_macd = float(macd_line.iloc[-1])
+    cur_signal = float(signal_line.iloc[-1])
+    cur_hist = float(histogram.iloc[-1])
+    prev_hist = float(histogram.iloc[-2]) if n >= 2 else 0.0
+    cur_upper = float(bb_upper.iloc[-1]) if not np.isnan(bb_upper.iloc[-1]) else last_close * 1.01
+    cur_lower = float(bb_lower.iloc[-1]) if not np.isnan(bb_lower.iloc[-1]) else last_close * 0.99
+    cur_mid = float(bb_mid.iloc[-1]) if not np.isnan(bb_mid.iloc[-1]) else last_close
+    cur_atr = float(atr_vals.iloc[-1]) if not np.isnan(atr_vals.iloc[-1]) else abs(last_close * 0.002)
+    bb_width = (cur_upper - cur_lower) / cur_mid if cur_mid > 0 else 0.0
+
+    support, resistance = find_support_resistance(df)
+
+    # --- Trend scoring ---
+    bull, bear = 0, 0
+    ema_aligned_bull = cur_ema9 > cur_ema21 > cur_ema50
+    ema_aligned_bear = cur_ema9 < cur_ema21 < cur_ema50
+    macd_bull = cur_macd > cur_signal
+
+    if ema_aligned_bull: bull += 3
+    if ema_aligned_bear: bear += 3
+    if last_close > cur_ema21: bull += 1
+    else: bear += 1
+    if last_close > cur_ema50: bull += 1
+    else: bear += 1
+    if cur_rsi > 55: bull += 1
+    if cur_rsi < 45: bear += 1
+    if cur_rsi > 65: bull += 1
+    if cur_rsi < 35: bear += 1
+    if macd_bull: bull += 2
+    else: bear += 2
+    if cur_hist > 0 and cur_hist > prev_hist: bull += 1
+    if cur_hist < 0 and cur_hist < prev_hist: bear += 1
+    if last_close > cur_mid: bull += 1
+    else: bear += 1
+
+    # Direction from candle strings (UP/DOWN)
+    if "Direction" in df.columns:
+        recent_dirs = df["Direction"].tail(10)
+        up_count = (recent_dirs.str.upper().isin(["UP", "BULL", "BUY"])).sum()
+        dn_count = (recent_dirs.str.upper().isin(["DOWN", "BEAR", "SELL"])).sum()
+        if up_count > dn_count: bull += 1
+        elif dn_count > up_count: bear += 1
+
+    total = bull + bear or 1
+    bias = bull / total
+
+    if bias >= 0.60:
+        trend = "BULLISH"
+        strength = min(100, int(bias * 100 + 5))
+    elif bias <= 0.40:
+        trend = "BEARISH"
+        strength = min(100, int((1 - bias) * 100 + 5))
+    else:
+        trend = "SIDEWAYS"
+        strength = 50
+
+    # --- Signal list ---
+    signals = []
+    if cur_rsi < 30:
+        signals.append(f"RSI oversold ({cur_rsi:.1f}) — potential reversal up")
+    elif cur_rsi > 70:
+        signals.append(f"RSI overbought ({cur_rsi:.1f}) — potential reversal down")
+    if ema_aligned_bull:
+        signals.append("EMA 9/21/50 bullish stack")
+    elif ema_aligned_bear:
+        signals.append("EMA 9/21/50 bearish stack")
+    if macd_bull and cur_hist > 0 and prev_hist < 0:
+        signals.append("MACD bullish crossover")
+    elif not macd_bull and cur_hist < 0 and prev_hist > 0:
+        signals.append("MACD bearish crossover")
+    elif macd_bull:
+        signals.append("MACD above signal line (bullish momentum)")
+    else:
+        signals.append("MACD below signal line (bearish momentum)")
+    if last_close > cur_upper:
+        signals.append("Price above upper BB — breakout or overbought")
+    elif last_close < cur_lower:
+        signals.append("Price below lower BB — breakout or oversold")
+    if not signals:
+        signals.append("No strong signals — consolidation likely")
+
+    commentary = (
+        f"RSI={cur_rsi:.1f} | EMA9={cur_ema9:.3f} EMA21={cur_ema21:.3f} EMA50={cur_ema50:.3f} | "
+        f"MACD {'bullish' if macd_bull else 'bearish'} (hist={cur_hist:+.3f}) | "
+        f"BB width={bb_width:.4f} ({'high' if bb_width > 0.008 else 'moderate' if bb_width > 0.004 else 'low'} volatility)."
     )
 
-    # Closed deals
-    deals = data["closed_deals"]
-    deals_text = "No closed deals." if not deals else "\n".join(
-        f"  - [{d.get('Time','?')}] {d.get('Type','?')} {d.get('Volume','?')} lots"
-        f" open @ {d.get('Price','?')}, close @ {d.get('Price_2','?')}, Profit={d.get('Profit','?')}"
-        for d in deals
-    )
-
-    # Candle summaries (last N candles only to stay within token budget)
-    def candle_rows(candles, limit=MAX_CANDLES_IN_PROMPT):
-        recent = candles[:limit]
-        rows = ["Time,Dir,Open,High,Low,Close,Volume"] + [
-            f"{c.get('Time','?')},{c.get('Direction','?')},{c.get('Open','?')},{c.get('High','?')},{c.get('Low','?')},{c.get('Close','?')},{c.get('Volume','?')}"
-            for c in recent
-        ]
-        return "\n".join(rows)
-
-    m5_text = candle_rows(data["m5_candles"])
-    m15_text = candle_rows(data["m15_candles"])
-    h1_text = candle_rows(data["h1_candles"])
-
-    prompt = f"""You are an expert forex and commodities trading analyst specializing in XAUUSD (Gold/USD).
-Analyze the following live trading data and produce a comprehensive structured analysis.
-
-## Market Snapshot
-- Symbol: {symbol}
-- Report Time: {report_time}
-- Current Bid: {bid}
-- Current Ask: {ask}
-
-## Active Positions
-{active_text}
-
-## Last 5 Closed Deals (most recent first)
-{deals_text}
-
-## M5 Candles (last {MAX_CANDLES_IN_PROMPT} bars, most recent first)
-{m5_text}
-
-## M15 Candles (last {MAX_CANDLES_IN_PROMPT} bars, most recent first)
-{m15_text}
-
-## H1 Candles (last {MAX_CANDLES_IN_PROMPT} bars, most recent first)
-{h1_text}
-
----
-
-## Analysis Requirements
-
-Provide your analysis in the following JSON format (no additional text outside the JSON block):
-
-```json
-{{
-  "analysis_timestamp": "<ISO 8601 UTC timestamp>",
-  "symbol": "{symbol}",
-  "current_price": {{
-    "bid": <number>,
-    "ask": <number>,
-    "spread_pips": <number>
-  }},
-  "performance_summary": {{
-    "closed_deals_count": <integer>,
-    "winning_trades": <integer>,
-    "losing_trades": <integer>,
-    "win_rate_pct": <number>,
-    "total_profit": <number>,
-    "avg_profit_per_trade": <number>,
-    "best_trade_profit": <number>,
-    "worst_trade_profit": <number>,
-    "commentary": "<2-3 sentence summary>"
-  }},
-  "risk_assessment": {{
-    "active_positions_count": <integer>,
-    "total_exposure_lots": <number>,
-    "risk_level": "<LOW|MEDIUM|HIGH|CRITICAL>",
-    "open_pnl": <number>,
-    "risk_warnings": ["<warning>"],
-    "commentary": "<2-3 sentence assessment>"
-  }},
-  "technical_analysis": {{
-    "m5": {{
-      "trend": "<BULLISH|BEARISH|SIDEWAYS>",
-      "strength": <0-100>,
-      "key_levels": {{"support": <number>, "resistance": <number>}},
-      "last_close": <number>,
-      "signals": ["<signal>"],
-      "commentary": "<brief>"
-    }},
-    "m15": {{
-      "trend": "<BULLISH|BEARISH|SIDEWAYS>",
-      "strength": <0-100>,
-      "key_levels": {{"support": <number>, "resistance": <number>}},
-      "last_close": <number>,
-      "signals": ["<signal>"],
-      "commentary": "<brief>"
-    }},
-    "h1": {{
-      "trend": "<BULLISH|BEARISH|SIDEWAYS>",
-      "strength": <0-100>,
-      "key_levels": {{"support": <number>, "resistance": <number>}},
-      "last_close": <number>,
-      "signals": ["<signal>"],
-      "commentary": "<brief>"
-    }}
-  }},
-  "trading_signals": [
-    {{
-      "timeframe": "<M5|M15|H1>",
-      "type": "<BUY|SELL|HOLD>",
-      "entry_price": <number>,
-      "stop_loss": <number>,
-      "take_profit": <number>,
-      "risk_reward_ratio": <number>,
-      "confidence_pct": <0-100>,
-      "reason": "<explanation>"
-    }}
-  ],
-  "final_recommendation": {{
-    "action": "<BUY|SELL|HOLD>",
-    "confidence_pct": <0-100>,
-    "entry_price": <number>,
-    "stop_loss": <number>,
-    "take_profit": <number>,
-    "risk_reward_ratio": <number>,
-    "position_size_suggestion": "<e.g., 0.01-0.05 lots for conservative risk>",
-    "time_horizon": "<e.g., 1-4 hours>",
-    "reasoning": "<3-5 sentence detailed reasoning>",
-    "key_risks": ["<risk>"],
-    "invalidation_level": <number>
-  }},
-  "market_context": {{
-    "volatility": "<LOW|MEDIUM|HIGH>",
-    "session": "<ASIAN|LONDON|NEW_YORK|OVERLAP>",
-    "market_sentiment": "<BULLISH|BEARISH|NEUTRAL>",
-    "commentary": "<2-3 sentences on broader context>"
-  }}
-}}
-```
-
-Respond ONLY with the JSON block above. No preamble, no explanation outside the JSON.
-"""
-    return prompt
+    return {
+        "trend": trend,
+        "strength": strength,
+        "key_levels": {"support": support, "resistance": resistance},
+        "last_close": round(last_close, 3),
+        "signals": signals[:4],
+        "commentary": commentary,
+        # Private fields for recommendation engine
+        "_rsi": cur_rsi,
+        "_macd_bull": macd_bull,
+        "_ema9": cur_ema9,
+        "_ema21": cur_ema21,
+        "_ema50": cur_ema50,
+        "_atr": round(cur_atr, 3),
+        "_bb_upper": round(cur_upper, 3),
+        "_bb_lower": round(cur_lower, 3),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Copilot API call
+# Performance summary from closed deals
 # ---------------------------------------------------------------------------
 
-def call_copilot_api(prompt: str, model: str, token: str, max_retries: int = 3) -> str:
-    """Call GitHub Copilot chat completions API and return the raw response text."""
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Copilot-Integration-Id": "github-copilot-trading-analysis",
-        "Editor-Version": "vscode/1.90.0",
-        "Editor-Plugin-Version": "copilot-chat/0.16.0",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert trading analyst. You always respond with valid JSON only, "
-                    "exactly as instructed. No markdown fences, no additional commentary."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 4096,
-        "top_p": 0.95,
-    }
+def calc_performance_summary(closed_deals: list) -> dict:
+    if not closed_deals:
+        return {
+            "closed_deals_count": 0, "winning_trades": 0, "losing_trades": 0,
+            "win_rate_pct": 0.0, "total_profit": 0.0, "avg_profit_per_trade": 0.0,
+            "best_trade_profit": 0.0, "worst_trade_profit": 0.0,
+            "commentary": "No closed deals available for performance assessment.",
+        }
 
-    for attempt in range(1, max_retries + 1):
+    profits = []
+    for d in closed_deals:
+        raw = d.get("Profit", "0") or "0"
         try:
-            response = requests.post(
-                COPILOT_API_URL, headers=headers, json=payload, timeout=120
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
-            elif response.status_code == 429:
-                wait = 2 ** attempt
-                print(f"[WARN] Rate limited (attempt {attempt}). Waiting {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"[ERROR] API error {response.status_code}: {response.text[:500]}")
-                if attempt == max_retries:
-                    raise RuntimeError(
-                        f"Copilot API returned {response.status_code}: {response.text[:200]}"
-                    )
-                time.sleep(2)
-        except requests.exceptions.Timeout:
-            print(f"[WARN] Request timed out (attempt {attempt})")
-            if attempt == max_retries:
-                raise
+            profits.append(float(raw))
+        except ValueError:
+            pass
 
-    raise RuntimeError("All API attempts failed")
+    if not profits:
+        return {
+            "closed_deals_count": len(closed_deals), "winning_trades": 0,
+            "losing_trades": 0, "win_rate_pct": 0.0, "total_profit": 0.0,
+            "avg_profit_per_trade": 0.0, "best_trade_profit": 0.0,
+            "worst_trade_profit": 0.0,
+            "commentary": "Could not parse profit values from closed deals.",
+        }
 
+    winners = [p for p in profits if p > 0]
+    losers = [p for p in profits if p <= 0]
+    total = sum(profits)
+    win_rate = (len(winners) / len(profits) * 100) if profits else 0.0
+    avg = total / len(profits) if profits else 0.0
 
-def extract_json_from_response(raw: str) -> dict:
-    """Extract and parse JSON from model response (handles markdown fences)."""
-    text = raw.strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
-        inner = "\n".join(lines[1:])
-        if inner.rstrip().endswith("```"):
-            inner = "\n".join(inner.rstrip().split("\n")[:-1])
-        text = inner.strip()
-    return json.loads(text)
+    if win_rate >= 60:
+        perf_text = "above-average win rate"
+    elif win_rate >= 40:
+        perf_text = "moderate win rate"
+    else:
+        perf_text = "below-average win rate"
+
+    commentary = (
+        f"{len(profits)} recent closed deals with a {win_rate:.1f}% win rate ({perf_text}). "
+        f"Total P&L: {total:+.2f}. "
+        f"Best: {max(profits):+.2f} | Worst: {min(profits):+.2f}."
+    )
+
+    return {
+        "closed_deals_count": len(profits),
+        "winning_trades": len(winners),
+        "losing_trades": len(losers),
+        "win_rate_pct": round(win_rate, 1),
+        "total_profit": round(total, 2),
+        "avg_profit_per_trade": round(avg, 2),
+        "best_trade_profit": round(max(profits), 2),
+        "worst_trade_profit": round(min(profits), 2),
+        "commentary": commentary,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Verification pass
+# Risk assessment from active positions
 # ---------------------------------------------------------------------------
 
-def verify_analysis(primary_result: dict, data: dict, model: str, token: str) -> dict:
-    """Run a second lighter verification pass with a different model."""
-    summary_prompt = f"""You are a second-opinion trading analyst.
-Review this primary analysis and verify or adjust the final recommendation.
+def calc_risk_assessment(active_positions: list) -> dict:
+    if not active_positions:
+        return {
+            "active_positions_count": 0, "total_exposure_lots": 0.0,
+            "risk_level": "LOW", "open_pnl": 0.0,
+            "risk_warnings": ["No open positions — no current market exposure."],
+            "commentary": "No active positions. Capital is not currently at risk.",
+        }
 
-Primary analysis summary:
-- Symbol: {primary_result.get('symbol')}
-- Final recommendation: {json.dumps(primary_result.get('final_recommendation', {}), indent=2)}
-- Technical signals detected: {json.dumps([s.get('type') for s in primary_result.get('trading_signals', [])], indent=2)}
-- Market context: {json.dumps(primary_result.get('market_context', {}), indent=2)}
+    total_lots = 0.0
+    open_pnl = 0.0
+    warnings = []
 
-Active positions: {len(data.get('active_positions', []))}
-Recent candle trend M15: {data['m15_candles'][0].get('Direction','?') if data['m15_candles'] else 'N/A'}
+    for p in active_positions:
+        try:
+            total_lots += float(p.get("Volume", 0) or 0)
+        except ValueError:
+            pass
+        try:
+            open_pnl += float(p.get("Profit", 0) or 0)
+        except ValueError:
+            pass
+        if p.get("S/L") in ("-", "", None):
+            warnings.append(f"Ticket {p.get('Ticket','?')} has no Stop Loss set — unlimited downside risk")
 
-Respond ONLY with a JSON object in this exact format:
-{{
-  "verified": <true|false>,
-  "agreement_level": "<AGREE|PARTIAL|DISAGREE>",
-  "adjusted_action": "<BUY|SELL|HOLD>",
-  "adjusted_confidence_pct": <0-100>,
-  "notes": "<1-2 sentences on any adjustments or confirmations>"
-}}
-"""
-    raw = call_copilot_api(summary_prompt, model, token)
-    return extract_json_from_response(raw)
+    if total_lots > 1.0:
+        risk_level = "CRITICAL"
+    elif total_lots > 0.5:
+        risk_level = "HIGH"
+    elif total_lots > 0.1:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    if open_pnl < -50:
+        risk_level = "HIGH" if risk_level == "MEDIUM" else risk_level
+        warnings.append(f"Open P&L deeply negative ({open_pnl:+.2f})")
+
+    commentary = (
+        f"{len(active_positions)} active position(s) totalling {total_lots:.2f} lots. "
+        f"Open P&L: {open_pnl:+.2f}. Risk level assessed as {risk_level}."
+    )
+
+    return {
+        "active_positions_count": len(active_positions),
+        "total_exposure_lots": round(total_lots, 2),
+        "risk_level": risk_level,
+        "open_pnl": round(open_pnl, 2),
+        "risk_warnings": warnings if warnings else ["No critical risk warnings detected."],
+        "commentary": commentary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Market session detection
+# ---------------------------------------------------------------------------
+
+def detect_market_session(report_time_str: str) -> tuple:
+    """Returns (session_name, volatility_hint)."""
+    try:
+        dt = datetime.strptime(report_time_str.strip(), "%Y.%m.%d %H:%M:%S")
+        hour = dt.hour
+    except Exception:
+        return "UNKNOWN", "MEDIUM"
+
+    if 0 <= hour < 7:
+        return "ASIAN", "LOW"
+    elif 7 <= hour < 9:
+        return "LONDON", "MEDIUM"
+    elif 9 <= hour < 12:
+        return "LONDON", "HIGH"
+    elif 12 <= hour < 13:
+        return "OVERLAP", "HIGH"
+    elif 13 <= hour < 17:
+        return "NEW_YORK", "HIGH"
+    elif 17 <= hour < 20:
+        return "NEW_YORK", "MEDIUM"
+    else:
+        return "ASIAN", "LOW"
+
+
+# ---------------------------------------------------------------------------
+# Final recommendation engine
+# ---------------------------------------------------------------------------
+
+def generate_recommendation(ta: dict, bid: float, ask: float,
+                             session: str, risk: dict) -> dict:
+    """
+    Combine multi-timeframe signals into a single actionable recommendation.
+    Uses H1 for trend, M15 for confirmation, M5 for entry timing.
+    Stop/Take-profit derived from H1 ATR.
+    """
+    h1 = ta["h1"]
+    m15 = ta["m15"]
+    m5 = ta["m5"]
+
+    # Weighted vote: H1=3, M15=2, M5=1
+    bull_votes = 0
+    bear_votes = 0
+    weights = [(h1, 3), (m15, 2), (m5, 1)]
+    for tf_data, w in weights:
+        if tf_data["trend"] == "BULLISH":
+            bull_votes += w
+        elif tf_data["trend"] == "BEARISH":
+            bear_votes += w
+
+    total_votes = bull_votes + bear_votes or 1
+    mid_price = (bid + ask) / 2
+
+    # RSI confluence
+    h1_rsi = h1.get("_rsi", 50)
+    m15_rsi = m15.get("_rsi", 50)
+    avg_rsi = (h1_rsi + m15_rsi) / 2
+
+    # Base action from vote
+    if bull_votes > bear_votes:
+        action = "BUY"
+        base_conf = int(bull_votes / total_votes * 80)
+    elif bear_votes > bull_votes:
+        action = "SELL"
+        base_conf = int(bear_votes / total_votes * 80)
+    else:
+        action = "HOLD"
+        base_conf = 45
+
+    # RSI filter: avoid buying overbought / selling oversold
+    if action == "BUY" and avg_rsi > 70:
+        action = "HOLD"
+        base_conf = max(30, base_conf - 20)
+    if action == "SELL" and avg_rsi < 30:
+        action = "HOLD"
+        base_conf = max(30, base_conf - 20)
+
+    # Use H1 ATR for SL/TP levels
+    h1_atr = h1.get("_atr", abs(mid_price * 0.003))
+    if h1_atr == 0:
+        h1_atr = abs(mid_price * 0.003)
+
+    if action == "BUY":
+        entry = round(ask, 3)
+        stop_loss = round(entry - 1.5 * h1_atr, 3)
+        take_profit = round(entry + 2.5 * h1_atr, 3)
+    elif action == "SELL":
+        entry = round(bid, 3)
+        stop_loss = round(entry + 1.5 * h1_atr, 3)
+        take_profit = round(entry - 2.5 * h1_atr, 3)
+    else:
+        entry = round(mid_price, 3)
+        stop_loss = round(mid_price - 2.0 * h1_atr, 3)
+        take_profit = round(mid_price + 2.0 * h1_atr, 3)
+
+    sl_dist = abs(entry - stop_loss)
+    tp_dist = abs(entry - take_profit)
+    rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+
+    # Confidence adjustments
+    if h1["trend"] == m15["trend"]:
+        base_conf = min(90, base_conf + 5)
+    if m5["trend"] == action.replace("HOLD", m15["trend"]):
+        base_conf = min(90, base_conf + 3)
+    if rr >= 2.0:
+        base_conf = min(90, base_conf + 2)
+    if session in ("LONDON", "NEW_YORK", "OVERLAP"):
+        base_conf = min(90, base_conf + 2)
+    if risk["risk_level"] in ("HIGH", "CRITICAL"):
+        base_conf = max(20, base_conf - 10)
+
+    # Reasoning
+    trend_line = f"H1 is {h1['trend']} (strength {h1['strength']}/100)"
+    m15_line = f"M15 confirms {m15['trend']} direction"
+    rsi_line = f"RSI confluence: H1={h1_rsi:.1f}, M15={m15_rsi:.1f}"
+    session_line = f"Session: {session} — {'active liquidity' if session in ('LONDON','NEW_YORK','OVERLAP') else 'limited liquidity'}"
+    reasoning = f"{trend_line}. {m15_line}. {rsi_line}. {session_line}. ATR({h1_atr:.3f})-based SL/TP gives R/R of {rr}."
+
+    # Key risks
+    key_risks = []
+    if avg_rsi > 65:
+        key_risks.append("RSI elevated — risk of exhaustion or reversal")
+    if avg_rsi < 35:
+        key_risks.append("RSI depressed — risk of bounce reversal")
+    if h1["trend"] != m15["trend"]:
+        key_risks.append("H1 and M15 trend divergence — reduced conviction")
+    if session == "ASIAN":
+        key_risks.append("Low-liquidity Asian session — wider spreads possible")
+    if not key_risks:
+        key_risks.append("No major structural risks identified at this time")
+
+    # Invalidation level
+    if action == "BUY":
+        invalidation = round(h1["key_levels"]["support"] - h1_atr * 0.5, 3)
+    elif action == "SELL":
+        invalidation = round(h1["key_levels"]["resistance"] + h1_atr * 0.5, 3)
+    else:
+        invalidation = round(mid_price - 3 * h1_atr, 3)
+
+    return {
+        "action": action,
+        "confidence_pct": base_conf,
+        "entry_price": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_reward_ratio": rr,
+        "position_size_suggestion": "0.01–0.05 lots (conservative, ≤1% account risk per trade)",
+        "time_horizon": "1–4 hours" if action != "HOLD" else "Monitor — await clearer signal",
+        "reasoning": reasoning,
+        "key_risks": key_risks,
+        "invalidation_level": invalidation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trading signals per timeframe
+# ---------------------------------------------------------------------------
+
+def generate_signals(ta: dict, bid: float, ask: float) -> list:
+    signals = []
+    mid = (bid + ask) / 2
+
+    for tf_key, tf_label in [("m5", "M5"), ("m15", "M15"), ("h1", "H1")]:
+        tf = ta[tf_key]
+        if tf["trend"] == "SIDEWAYS":
+            continue
+
+        atr = tf.get("_atr", mid * 0.002)
+        if atr == 0:
+            atr = mid * 0.002
+
+        if tf["trend"] == "BULLISH":
+            entry = round(ask, 3)
+            sl = round(entry - 1.5 * atr, 3)
+            tp = round(entry + 2.5 * atr, 3)
+            sig_type = "BUY"
+        else:
+            entry = round(bid, 3)
+            sl = round(entry + 1.5 * atr, 3)
+            tp = round(entry - 2.5 * atr, 3)
+            sig_type = "SELL"
+
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(entry - tp)
+        rr = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+        reason = f"{tf_label} {tf['trend']} — {tf['signals'][0] if tf['signals'] else 'trend continuation'}"
+
+        signals.append({
+            "timeframe": tf_label,
+            "type": sig_type,
+            "entry_price": entry,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "risk_reward_ratio": rr,
+            "confidence_pct": tf["strength"],
+            "reason": reason,
+        })
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Cross-check (second pass using indicator divergence)
+# ---------------------------------------------------------------------------
+
+def cross_check(rec: dict, ta: dict) -> dict:
+    """Simple rule-based second opinion."""
+    action = rec["action"]
+    h1 = ta["h1"]
+    m15 = ta["m15"]
+
+    agrees = 0
+    disagrees = 0
+
+    if h1["trend"] == action.replace("HOLD", "SIDEWAYS"):
+        agrees += 1
+    else:
+        disagrees += 1
+    if m15["trend"] == action.replace("HOLD", "SIDEWAYS"):
+        agrees += 1
+    else:
+        disagrees += 1
+    if h1.get("_macd_bull") and action == "BUY":
+        agrees += 1
+    elif not h1.get("_macd_bull") and action == "SELL":
+        agrees += 1
+    else:
+        disagrees += 1
+
+    if agrees > disagrees:
+        level = "AGREE"
+        adj_action = action
+        adj_conf = min(90, rec["confidence_pct"] + 3)
+        notes = "Cross-check confirms primary analysis. Indicators aligned with recommendation."
+    elif agrees == disagrees:
+        level = "PARTIAL"
+        adj_action = action
+        adj_conf = rec["confidence_pct"]
+        notes = "Mixed signals across timeframes. Proceed with standard position sizing."
+    else:
+        level = "DISAGREE"
+        adj_action = "HOLD"
+        adj_conf = max(30, rec["confidence_pct"] - 15)
+        notes = "Cross-check diverges from primary. Consider waiting for clearer alignment."
+
+    return {
+        "verified": True,
+        "agreement_level": level,
+        "adjusted_action": adj_action,
+        "adjusted_confidence_pct": adj_conf,
+        "notes": notes,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -403,56 +702,139 @@ Respond ONLY with a JSON object in this exact format:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze forex trading data with Copilot AI")
+    parser = argparse.ArgumentParser(
+        description="Self-contained technical analysis for forex_data.csv"
+    )
     parser.add_argument("--csv", required=True, help="Path to forex_data.csv")
     parser.add_argument("--output", required=True, help="Path to output JSON file")
-    parser.add_argument("--model", default="claude-opus-4-5", help="Primary analysis model")
-    parser.add_argument("--verify-model", default="claude-sonnet-4-5", help="Verification model")
+    # Legacy flags kept for backward-compat with old workflow calls — ignored
+    parser.add_argument("--model", default=None, help="(ignored)")
+    parser.add_argument("--verify-model", default=None, help="(ignored)")
     args = parser.parse_args()
-
-    token = os.environ.get("COPILOT_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("[ERROR] COPILOT_TOKEN or GITHUB_TOKEN environment variable is required")
-        sys.exit(1)
 
     print(f"[INFO] Parsing {args.csv}...")
     data = parse_csv(args.csv)
-    print(f"[INFO] Parsed: {len(data['m5_candles'])} M5, {len(data['m15_candles'])} M15, {len(data['h1_candles'])} H1 candles")
-    print(f"[INFO] Active positions: {len(data['active_positions'])}, Closed deals: {len(data['closed_deals'])}")
+    print(
+        f"[INFO] Parsed: {len(data['m5_candles'])} M5, "
+        f"{len(data['m15_candles'])} M15, "
+        f"{len(data['h1_candles'])} H1 candles"
+    )
+    print(
+        f"[INFO] Active positions: {len(data['active_positions'])}, "
+        f"Closed deals: {len(data['closed_deals'])}"
+    )
 
-    print(f"[INFO] Running primary analysis with model: {args.model}")
-    prompt = build_analysis_prompt(data)
-    raw_response = call_copilot_api(prompt, args.model, token)
+    symbol = data["metadata"].get("symbol", "XAUUSD")
+    report_time = data["metadata"].get("report_time", "")
+    pair_info = data["pair_info"]
 
-    print("[INFO] Parsing primary analysis response...")
-    result = extract_json_from_response(raw_response)
-    result["primary_model"] = args.model
-    result["analysis_timestamp"] = datetime.now(timezone.utc).isoformat()
+    bid = float(pair_info.get("Current Bid", 0) or 0)
+    ask = float(pair_info.get("Current Ask", 0) or 0)
+    spread_pips = round(abs(ask - bid), 3)
+    mid = (bid + ask) / 2 if bid and ask else 0.0
 
-    print(f"[INFO] Running verification with model: {args.verify_model}")
-    try:
-        verification = verify_analysis(result, data, args.verify_model, token)
-        result["verification"] = verification
-        result["verification_model"] = args.verify_model
-        print(f"[INFO] Verification: {verification.get('agreement_level')} - {verification.get('notes')}")
-    except Exception as exc:
-        print(f"[WARN] Verification step failed (non-fatal): {exc}")
-        result["verification"] = {"verified": False, "notes": str(exc)}
+    # --- Technical analysis per timeframe ---
+    print("[INFO] Running technical analysis on H1...")
+    h1_ta = analyze_timeframe(data["h1_candles"], "H1")
+    print("[INFO] Running technical analysis on M15...")
+    m15_ta = analyze_timeframe(data["m15_candles"], "M15")
+    print("[INFO] Running technical analysis on M5...")
+    m5_ta = analyze_timeframe(data["m5_candles"], "M5")
+
+    ta = {"h1": h1_ta, "m15": m15_ta, "m5": m5_ta}
+
+    # Strip private _ fields for JSON output
+    def public(d: dict) -> dict:
+        return {k: v for k, v in d.items() if not k.startswith("_")}
+
+    ta_public = {
+        "h1": public(h1_ta),
+        "m15": public(m15_ta),
+        "m5": public(m5_ta),
+    }
+
+    # --- Performance & risk ---
+    print("[INFO] Calculating performance summary...")
+    perf = calc_performance_summary(data["closed_deals"])
+
+    print("[INFO] Calculating risk assessment...")
+    risk = calc_risk_assessment(data["active_positions"])
+
+    # --- Session & market context ---
+    session, vol_hint = detect_market_session(report_time)
+
+    # Override volatility from BB width of M15
+    bb_w = (m15_ta["_bb_upper"] - m15_ta["_bb_lower"]) / mid if mid > 0 else 0
+    if bb_w > 0.008:
+        volatility = "HIGH"
+    elif bb_w > 0.003:
+        volatility = "MEDIUM"
+    else:
+        volatility = vol_hint
+
+    if m15_ta["trend"] == "BULLISH" and h1_ta["trend"] == "BULLISH":
+        sentiment = "BULLISH"
+    elif m15_ta["trend"] == "BEARISH" and h1_ta["trend"] == "BEARISH":
+        sentiment = "BEARISH"
+    else:
+        sentiment = "NEUTRAL"
+
+    market_context = {
+        "volatility": volatility,
+        "session": session,
+        "market_sentiment": sentiment,
+        "commentary": (
+            f"Market is currently in the {session} session with {volatility.lower()} volatility. "
+            f"Confluence of timeframes suggests {sentiment.lower()} sentiment. "
+            f"Current bid/ask spread of {spread_pips} pips."
+        ),
+    }
+
+    # --- Signals & recommendation ---
+    print("[INFO] Generating trading signals...")
+    signals = generate_signals(ta, bid, ask)
+
+    print("[INFO] Building final recommendation...")
+    rec = generate_recommendation(ta, bid, ask, session, risk)
+
+    print("[INFO] Running cross-check verification...")
+    verification = cross_check(rec, ta)
+
+    # --- Assemble result ---
+    result = {
+        "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "current_price": {
+            "bid": round(bid, 3),
+            "ask": round(ask, 3),
+            "spread_pips": spread_pips,
+        },
+        "performance_summary": perf,
+        "risk_assessment": risk,
+        "technical_analysis": ta_public,
+        "trading_signals": signals,
+        "final_recommendation": rec,
+        "market_context": market_context,
+        "primary_model": "python-technical-analysis-v1",
+        "verification": verification,
+        "verification_model": "python-cross-check-v1",
+    }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print(f"[INFO] Analysis written to {args.output}")
 
-    # Print summary to stdout for workflow logs
-    rec = result.get("final_recommendation", {})
+    # Print summary
+    r = result["final_recommendation"]
     print("\n" + "=" * 60)
-    print(f"  RECOMMENDATION : {rec.get('action','?')}")
-    print(f"  CONFIDENCE     : {rec.get('confidence_pct','?')}%")
-    print(f"  ENTRY PRICE    : {rec.get('entry_price','?')}")
-    print(f"  STOP LOSS      : {rec.get('stop_loss','?')}")
-    print(f"  TAKE PROFIT    : {rec.get('take_profit','?')}")
-    print(f"  R/R RATIO      : {rec.get('risk_reward_ratio','?')}")
+    print(f"  RECOMMENDATION : {r['action']}")
+    print(f"  CONFIDENCE     : {r['confidence_pct']}%")
+    print(f"  ENTRY PRICE    : {r['entry_price']}")
+    print(f"  STOP LOSS      : {r['stop_loss']}")
+    print(f"  TAKE PROFIT    : {r['take_profit']}")
+    print(f"  R/R RATIO      : {r['risk_reward_ratio']}")
+    print(f"  VERIFICATION   : {verification['agreement_level']} — {verification['notes']}")
     print("=" * 60)
 
 

@@ -137,9 +137,12 @@ def main():
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-    if not bot_token or not chat_id:
-        print("[ERROR] TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
-        sys.exit(1)
+    if not bot_token:
+        print("[WARN] TELEGRAM_BOT_TOKEN not set — skipping Telegram notification")
+        sys.exit(0)
+    if not chat_id:
+        print("[WARN] TELEGRAM_CHAT_ID not set — skipping Telegram notification")
+        sys.exit(0)
 
     with open(args.input, "r", encoding="utf-8") as f:
         result = json.load(f)

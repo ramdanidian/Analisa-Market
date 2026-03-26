@@ -5,24 +5,23 @@
 This repository uses a **GitHub Actions workflow** to automatically analyze `forex_data.csv`
 every time the file is updated (pushed to the repository).
 
-The workflow calls the **GitHub Copilot API** (Claude Opus 4.5 as primary model and
-Claude Sonnet 4.5 as verification model) to generate a comprehensive trading analysis
-and commits the report back to the repo. Optionally, it creates a GitHub Issue and
-sends a Telegram notification.
+All analysis is performed **locally in Python** using technical indicators — no external
+AI subscription or API key is required.
 
 ```
 EA (MT5) pushes forex_data.csv every 5 minutes
          ↓
 GitHub detects push → triggers workflow
          ↓
-analyze_trading.py  → Copilot API (Claude Opus 4.5)
-         ↓  (verification)
-                    → Copilot API (Claude Sonnet 4.5)
+analyze_trading.py  → Python technical analysis
+                        RSI · EMA 9/21/50 · MACD · Bollinger Bands · ATR · S/R
+         ↓  (cross-check)
+                      → Rule-based second-opinion verification
          ↓
 generate_report.py  → ANALYSIS_REPORT.md + analysis_history.json
          ↓
 create_discussion.py → GitHub Issue (with Copilot agent session link)
-         ↓  (optional)
+         ↓  (always runs — skips gracefully if token absent)
 notify_telegram.py  → Telegram bot message
          ↓
 git commit + push   → results committed to repo
@@ -35,10 +34,10 @@ git commit + push   → results committed to repo
 | File | Purpose |
 |------|---------|
 | `.github/workflows/auto-trading-analysis.yml` | Main GitHub Actions workflow |
-| `scripts/analyze_trading.py` | Core analysis — calls Copilot API, returns JSON |
+| `scripts/analyze_trading.py` | Core analysis — pure Python indicators, returns JSON |
 | `scripts/generate_report.py` | Generates Markdown report + maintains 30-day history |
 | `scripts/create_discussion.py` | Creates a GitHub Issue with the analysis |
-| `scripts/notify_telegram.py` | Sends a summary to Telegram (optional) |
+| `scripts/notify_telegram.py` | Sends a summary to Telegram |
 | `ANALYSIS_REPORT.md` | Latest analysis report (auto-generated, committed by bot) |
 | `analysis_history.json` | Rolling 30-day history of all analyses (auto-generated) |
 | `analysis_result.json` | Raw JSON output of the last analysis run (CI artifact) |
@@ -58,27 +57,27 @@ Go to **Settings → Actions → General → Workflow permissions** and select:
 - ✅ **Read and write permissions**
 - ✅ **Allow GitHub Actions to create and approve pull requests**
 
-### 3. (Optional) Add Telegram secrets
+### 3. Add Telegram bot token secret
 
-If you want Telegram notifications, add the following secrets under
-**Settings → Secrets and variables → Actions → New repository secret**:
+The Telegram chat ID is already configured in the workflow (`1823341851`).
+You only need to add the **bot token** as a secret:
+
+Go to **Settings → Secrets and variables → Actions → New repository secret**:
 
 | Secret name | Value |
 |-------------|-------|
-| `TELEGRAM_BOT_TOKEN` | Your bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT_ID` | Your chat/channel ID (use [@userinfobot](https://t.me/userinfobot) to find it) |
+| `TELEGRAM_BOT_TOKEN` | Your bot token (from [@BotFather](https://t.me/BotFather)) |
 
-No Telegram secrets = the notification step is automatically skipped.
+> If this secret is not set the Telegram step is skipped automatically — no error.
 
 ### 4. Push `forex_data.csv`
 
 Every time `forex_data.csv` is pushed (e.g. every 5 minutes from your MT5 EA),
-the workflow runs automatically.
+the workflow runs automatically. No API keys or subscriptions needed.
 
 ### 5. Manually trigger (optional)
 
-Go to **Actions → Auto Trading Analysis → Run workflow** to trigger manually
-with custom model and options.
+Go to **Actions → Auto Trading Analysis → Run workflow** to trigger manually.
 
 ---
 
@@ -86,24 +85,24 @@ with custom model and options.
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `model` | `claude-opus-4-5` | Primary analysis model |
 | `create_issue` | `true` | Create a GitHub Issue with analysis |
-| `send_telegram` | `false` | Send Telegram notification |
+| `send_telegram` | `true` | Send Telegram notification |
 
 ---
 
-## AI Models
+## Technical Indicators Used
 
-| Model ID | Role | Token limit |
-|----------|------|-------------|
-| `claude-opus-4-5` | Primary analysis (deep reasoning) | 200K |
-| `claude-sonnet-4-5` | Verification pass (fast cross-check) | 200K |
-| `gpt-4o` | Alternative if Claude unavailable | 128K |
+| Indicator | Parameters | Purpose |
+|-----------|-----------|---------|
+| EMA | 9, 21, 50 | Trend direction & alignment |
+| RSI | 14 | Momentum / overbought-oversold |
+| MACD | 12, 26, 9 | Momentum crossover signals |
+| Bollinger Bands | 20, 2σ | Volatility & breakout detection |
+| ATR | 14 | Stop loss / take profit sizing |
+| Support/Resistance | 30-bar swing | Key price levels |
 
-All models are accessed via the **GitHub Copilot API**
-(`https://api.githubcopilot.com/chat/completions`) using the built-in
-`GITHUB_TOKEN` — no separate API key or billing required when you have an
-active **Copilot Pro / Copilot Business** subscription.
+Analysis runs on **M5, M15, and H1** timeframes simultaneously.
+Final recommendation uses a **weighted vote** (H1=3, M15=2, M5=1).
 
 ---
 
@@ -111,62 +110,34 @@ active **Copilot Pro / Copilot Business** subscription.
 
 ### `ANALYSIS_REPORT.md` (Markdown)
 
-The report includes:
 - 🎯 **Final Recommendation** — BUY / SELL / HOLD with confidence %
 - 📌 **Market Snapshot** — bid, ask, spread, session, volatility
 - 💰 **Performance Summary** — win rate, P&L, trade stats
 - 🛡️ **Risk Assessment** — exposure, open P&L, warnings
 - 📉 **Technical Analysis** — M5, M15, H1 trends and key levels
 - 📡 **Trading Signals** — entry, SL, TP, R/R ratio per timeframe
-- ✅ **Verification** — second-opinion from Claude Sonnet
+- ✅ **Verification** — rule-based second-opinion cross-check
 
 ### `analysis_history.json` (JSON)
 
-Rolling 30-day record of every analysis run. Each entry contains:
+Rolling 30-day record of every analysis run:
 
 ```json
 {
   "timestamp": "2026-03-26T07:34:00+00:00",
   "symbol": "XAUUSD",
-  "action": "BUY",
-  "confidence_pct": 72,
-  "entry_price": 4455.269,
-  "stop_loss": 4440.0,
-  "take_profit": 4480.0,
-  "risk_reward_ratio": 1.6,
-  "verification_agreement": "AGREE",
-  "win_rate_pct": 40.0,
-  "total_profit": 30.49,
+  "action": "SELL",
+  "confidence_pct": 87,
+  "entry_price": 4455.053,
+  "stop_loss": 4511.368,
+  "take_profit": 4361.195,
+  "risk_reward_ratio": 1.67,
+  "verification_agreement": "DISAGREE",
+  "win_rate_pct": 20.0,
+  "total_profit": 29.97,
   "risk_level": "LOW",
-  "primary_model": "claude-opus-4-5"
+  "primary_model": "python-technical-analysis-v1"
 }
-```
-
----
-
-## GitHub Issue / Copilot Agent Session
-
-Each analysis creates a GitHub Issue labelled **`trading-analysis`** with:
-- Summary card (action, confidence, entry/SL/TP)
-- Full Markdown report in a collapsible section
-- A direct link to start a **Copilot agent session** on the issue
-
-To do a deeper interactive analysis, open the Issue and click the Copilot
-icon to start an agent session. Example follow-up prompts:
-
-```
-Look at the active positions and the last 10 candles.
-Is the current HOLD recommendation still valid or should I adjust?
-```
-
-```
-Compare this analysis with the last 5 entries in analysis_history.json.
-Is the win rate improving or declining?
-```
-
-```
-Given the current M15 downtrend and RSI reading, what risk management
-adjustments should I make to the open positions?
 ```
 
 ---
@@ -176,19 +147,17 @@ adjustments should I make to the open positions?
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Workflow not triggered | `forex_data.csv` not in repo root | Move file or update `paths` in workflow |
-| `401 Unauthorized` from Copilot API | Token lacks Copilot scope | Ensure **Copilot Pro** is active on your account |
 | `403` on issue creation | Workflow lacks write permission | Enable read/write in **Settings → Actions → General** |
-| Telegram not sending | Missing secrets | Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` secrets |
+| Telegram not sending | Missing `TELEGRAM_BOT_TOKEN` secret | Add the bot token secret (see Quick Start step 3) |
 | Empty history file | First run | Normal — history grows with each push |
 
 ---
 
 ## Privacy & Cost
 
-- **No external API keys needed** — uses `GITHUB_TOKEN` (built-in, free)
-- **No third-party services** — all processing in GitHub Actions
-- **Copilot Pro** subscription covers all AI inference costs (no per-token billing)
-- **Telegram bot** is optional and free for personal use
+- **No external API keys needed** — analysis is pure Python
+- **No third-party AI services** — all processing in GitHub Actions (free)
+- **Telegram bot** requires adding one repository secret (`TELEGRAM_BOT_TOKEN`)
 
 ---
 
