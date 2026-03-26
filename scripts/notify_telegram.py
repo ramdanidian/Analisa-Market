@@ -9,8 +9,8 @@ Usage:
     python scripts/notify_telegram.py --input analysis_result.json
 
 Environment variables required:
-    8733820401:AAHwfK5O1_2rN421UDW1r43CvYpxGk9vY8U  - Telegram bot token (from @BotFather)
-    1823341851    - Target chat/channel ID
+    TELEGRAM_BOT_TOKEN  - Telegram bot token (from @BotFather)
+    TELEGRAM_CHAT_ID    - Target chat/channel ID
 """
 
 import argparse
