@@ -1,0 +1,33 @@
+name: Test Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Send Telegram Test Message
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: "1823341851"
+        run: |
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "text=🤖 <b>Halo dari GitHub Copilot Agent!</b>
+
+✅ Telegram berhasil terhubung ke repo <code>ramdanidian/Analisa-Market</code>.
+
+📊 Setiap kali file <code>forex_data.csv</code> di-push, analisa XAUUSD akan otomatis dikirimkan ke sini.
+
+Indikator yang digunakan:
+• EMA 9/21/50
+• RSI(14)
+• MACD(12,26,9)
+• Bollinger Bands
+• ATR(14)
+• Support/Resistance
+
+<i>Bot siap bekerja! 🚀</i>"
