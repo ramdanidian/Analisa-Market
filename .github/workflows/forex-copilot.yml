@@ -1,0 +1,122 @@
+name: Forex Copilot Analysis
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - forex_data.csv
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Copilot prompt from CSV
+        id: build_prompt
+        run: |
+          CSV_CONTENT=$(cat forex_data.csv)
+          NOW=$(date -u +"%d %b %Y, %H:%M")
+
+          PROMPT="You are an expert forex/gold trader. Analyze the following XAUUSD market data and return EXACTLY ONE trading action with ONE short rationale line. Use this fixed format (replace values with your analysis, keep the emoji and punctuation exactly):
+
+          ⚡ XAUUSD — ${NOW}
+          🔴 SELL @ <price> SL <stop_loss> | TP <take_profit>
+          <One concise reason in Bahasa Indonesia, max 25 words.>
+
+          OR if the signal is BUY:
+
+          ⚡ XAUUSD — ${NOW}
+          🟢 BUY @ <price> SL <stop_loss> | TP <take_profit>
+          <One concise reason in Bahasa Indonesia, max 25 words.>
+
+          Rules:
+          - Do NOT add any other text, explanation, or markdown.
+          - Output only the 3 lines above.
+          - Use UTC time already embedded above: ${NOW}.
+          - Price, SL, TP must be derived solely from the data below.
+
+          === MARKET DATA ===
+          ${CSV_CONTENT}"
+
+          # Write prompt to a temp file to avoid shell quoting issues
+          echo "$PROMPT" > /tmp/prompt.txt
+
+          # Build JSON payload with jq to handle special characters safely
+          jq -n \
+            --rawfile prompt /tmp/prompt.txt \
+            '{
+              model: "gpt-4o",
+              messages: [
+                {
+                  role: "user",
+                  content: $prompt
+                }
+              ],
+              max_tokens: 200,
+              temperature: 0.2
+            }' > /tmp/payload.json
+
+      - name: Call GitHub Copilot Chat API
+        id: copilot
+        run: |
+          RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.COPILOT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -H "Copilot-Integration-Id: vscode-chat" \
+            -H "Editor-Version: vscode/1.85.0" \
+            -H "Editor-Plugin-Version: GitHub.copilot-chat/0.12.0" \
+            -d @/tmp/payload.json \
+            "https://api.githubcopilot.com/chat/completions")
+
+          echo "API response: $RESPONSE"
+
+          # Extract the message content from the JSON response
+          ACTION=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+
+          if [ -z "$ACTION" ]; then
+            echo "ERROR: Empty response from Copilot API"
+            echo "Full response: $RESPONSE"
+            exit 1
+          fi
+
+          # Save to file to avoid length limits in environment variables
+          echo "$ACTION" > /tmp/action.txt
+          echo "Copilot action:"
+          cat /tmp/action.txt
+
+      - name: Post comment on triggering commit
+        run: |
+          ACTION=$(cat /tmp/action.txt)
+          COMMIT_SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+
+          # Escape the action text for JSON using jq
+          BODY=$(jq -n --arg text "$ACTION" '$text')
+
+          curl -s \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\": $BODY}" \
+            "https://api.github.com/repos/${REPO}/commits/${COMMIT_SHA}/comments"
+
+      - name: Send analysis to Telegram
+        run: |
+          ACTION=$(cat /tmp/action.txt)
+
+          curl -s \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --arg text "$ACTION" \
+              '{chat_id: $chat_id, text: $text}')" \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
