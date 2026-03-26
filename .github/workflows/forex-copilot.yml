@@ -3,8 +3,10 @@ name: Forex Copilot Analysis
 on:
   workflow_dispatch:
   push:
-    branches: [main]
-    paths: [forex_data.csv]
+    branches:
+      - main
+    paths:
+      - forex_data.csv
 
 permissions:
   contents: write
@@ -53,30 +55,31 @@ jobs:
             temperature: 0.2
           }' > /tmp/payload.json
 
-      - name: Create Copilot app token
-        id: app_token
-        uses: tibdex/github-app-token@v2
-        with:
-          app_id: ${{ secrets.COPILOT_APP_ID }}
-          private_key: ${{ secrets.COPILOT_APP_PRIVATE_KEY }}
-          installation_id: ${{ secrets.COPILOT_INSTALLATION_ID }}
-
       - name: Call GitHub Copilot Chat API
         id: copilot
         run: |
-          RESPONSE=$(curl -s \
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST \
-            -H "Authorization: Bearer ${{ steps.app_token.outputs.token }}" \
+            -H "Authorization: Bearer ${{ secrets.COPILOT_USER_TOKEN }}" \
             -H "Content-Type: application/json" \
             -H "Copilot-Integration-Id: actions-workflow" \
             -d @/tmp/payload.json \
             "https://api.githubcopilot.com/chat/completions")
 
-          echo "API response: $RESPONSE"
-          ACTION=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          BODY=$(printf "%s" "$RESPONSE" | head -n -1)
+          STATUS=$(printf "%s" "$RESPONSE" | tail -n 1)
+
+          echo "HTTP status: $STATUS"
+          echo "API body: $BODY"
+
+          if [ "$STATUS" != "200" ]; then
+            echo "ERROR: Copilot API returned status $STATUS"
+            exit 1
+          fi
+
+          ACTION=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
           if [ -z "$ACTION" ]; then
             echo "ERROR: Empty response from Copilot API"
-            echo "Full response: $RESPONSE"
             exit 1
           fi
           echo "$ACTION" > /tmp/action.txt
