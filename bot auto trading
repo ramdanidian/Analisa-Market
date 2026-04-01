@@ -1,0 +1,149 @@
+import MetaTrader5 as mt5
+from google import genai
+import time
+import json
+import csv
+import requests
+from datetime import datetime, timezone
+
+# ==========================================
+# 1. KONFIGURASI
+# ==========================================
+GEMINI_API_KEY = "AIzaSyBqQoScFUQveMjQNlD3JJidtzhf2wvx6oo"
+SYMBOL = "XAUUSD" 
+LOT_SIZE = 0.01
+CHECK_INTERVAL = 60 
+MODEL_NAME = "gemma-3-1b-it"
+
+DEBUG_MODE = True
+TELEGRAM_ENABLED = True
+TELEGRAM_TOKEN = "8733820401:AAHwfK5O1_2rN421UDW1r43CvYpxGk9vY8U"
+TELEGRAM_CHAT_ID = "1823341851"
+
+CANDLE_COUNTS = {"M5": 72, "M15": 48, "H1": 24}
+# ==========================================
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+def get_server_time_str():
+    tick = mt5.symbol_info_tick(SYMBOL)
+    ts = tick.time if tick else time.time()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+
+def add_summary_log(action, side, sl, tp):
+    t = get_server_time_str()
+    print(f"[{t}] {SYMBOL} -> {action} ({side}) | SL: {sl} | TP: {tp}", flush=True)
+
+def send_telegram(message):
+    if not TELEGRAM_ENABLED: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try: requests.post(url, json=payload, timeout=10)
+    except: pass
+
+def get_market_data_full():
+    tfs = {"M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1}
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if not tick: return None, None
+    live = {"bid": round(tick.bid, 2), "ask": round(tick.ask, 2)}
+    full_data = {}
+    for label, tf in tfs.items():
+        rates = mt5.copy_rates_from_pos(SYMBOL, tf, 1, CANDLE_COUNTS[label])
+        if rates is None: return None, None
+        full_data[label] = [
+            {"T": datetime.fromtimestamp(int(r[0]), tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
+             "O": round(r[1], 2), "H": round(r[2], 2), "L": round(r[3], 2), "C": round(r[4], 2), "V": int(r[5])}
+            for r in rates
+        ]
+    return full_data, live
+
+# --- EXECUTION ---
+def execute_open(side, sl, tp):
+    tick = mt5.symbol_info_tick(SYMBOL)
+    m_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if m_type == mt5.ORDER_TYPE_BUY else tick.bid
+    request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": LOT_SIZE, "type": m_type, "price": price, "sl": sl, "tp": tp, "magic": 999, "comment": "AI Autonomous", "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_FOK}
+    mt5.order_send(request)
+
+def execute_close(ticket):
+    pos = mt5.positions_get(ticket=ticket)
+    if not pos: return
+    p = pos[0]; tick = mt5.symbol_info_tick(SYMBOL)
+    request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": p.volume, "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY, "position": p.ticket, "price": tick.bid if p.type == 0 else tick.ask, "magic": 999, "type_filling": mt5.ORDER_FILLING_FOK}
+    mt5.order_send(request)
+
+def execute_modify(ticket, sl, tp):
+    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "symbol": SYMBOL, "position": ticket, "sl": sl, "tp": tp})
+
+# --- ENGINE ---
+def analyze_and_trade():
+    if not mt5.initialize(): return
+    print(f"[{get_server_time_str()}] AUTONOMOUS ENGINE LOADED - {SYMBOL}", flush=True)
+    next_run = time.time()
+
+    while True:
+        current_time = time.time()
+        if current_time >= next_run:
+            try:
+                next_run = current_time + CHECK_INTERVAL
+                market_data, live_price = get_market_data_full()
+                if not market_data: continue
+
+                pos = mt5.positions_get(symbol=SYMBOL)
+                current_pos = None
+                if pos:
+                    p = pos[0]
+                    current_pos = {"ticket": p.ticket, "type": "BUY" if p.type == 0 else "SELL", "sl": p.sl, "tp": p.tp, "profit": round(p.profit, 2)}
+                    opsi_aksi = "MODIFY, CLOSE, HOLD, COUNTER"
+                else:
+                    opsi_aksi = "OPEN, WAIT"
+
+                # PROMPT UNBURDENED (Broad Thinking)
+                prompt = f"""
+                You are an unburdened, high-level financial strategist. 
+                Your task is to manage trading decisions for {SYMBOL} with absolute autonomy.
+                Use your entire analytical knowledge base to interpret the provided data.
+
+                MARKET DATA:
+                - Current Price: {live_price}
+                - Historical Context: {json.dumps(market_data)}
+                - Your Current Position: {json.dumps(current_pos)}
+
+                GOAL:
+                Analyze the narrative across all timeframes. Decide the most logical next step to maximize profit and minimize risk. 
+                - If no position: Decide to OPEN or WAIT.
+                - If position active: Decide to MODIFY, CLOSE, HOLD, or COUNTER.
+
+                CONSTRAINT: Output JSON only. No explanation.
+                {{ "action": "{opsi_aksi}", "type": "BUY/SELL/NONE", "sl": 0.0, "tp": 0.0 }}
+                """
+                
+                response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+                res_text = response.text.strip()
+                if "{" in res_text: res_text = res_text[res_text.find("{"):res_text.rfind("}")+1]
+                decision = json.loads(res_text)
+                
+                # Debugging (Overwrite)
+                with open("debug_prompt_ai.txt", mode="w", encoding="utf-8") as f: f.write(prompt)
+                
+                action = str(decision.get("action")).upper()
+                side = str(decision.get("type")).upper()
+                sl_p, tp_p = float(decision.get("sl", 0)), float(decision.get("tp", 0))
+
+                # Telegram & Log
+                send_telegram(f"🌐 *{SYMBOL} AUTONOMOUS*\nAction: {action}\nSide: {side}\nSL: {sl_p} | TP: {tp_p}")
+                add_summary_log(action, side, sl_p, tp_p)
+
+                if not current_pos:
+                    if action == "OPEN" and side in ["BUY", "SELL"]: execute_open(side, sl_p, tp_p)
+                else:
+                    if action == "CLOSE": execute_close(current_pos['ticket'])
+                    elif action == "MODIFY": execute_modify(current_pos['ticket'], sl_p, tp_p)
+                    elif action == "COUNTER":
+                        execute_close(current_pos['ticket'])
+                        execute_open("SELL" if current_pos['type'] == "BUY" else "BUY", sl_p, tp_p)
+
+            except Exception: pass
+        time.sleep(1)
+
+if __name__ == "__main__": analyze_and_trade()
