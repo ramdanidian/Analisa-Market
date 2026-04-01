@@ -4,7 +4,18 @@ import time
 import json
 import csv
 import requests
+import logging
 from datetime import datetime, timezone
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
 
 # ==========================================
 # 1. KONFIGURASI
@@ -38,46 +49,210 @@ def send_telegram(message):
     if not TELEGRAM_ENABLED: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        logging.info(f"Telegram message sent: {message[:50]}...")
+    except Exception as e:
+        logging.error(f"Failed to send Telegram message: {e}")
 
 def get_market_data_full():
-    tfs = {"M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1}
-    tick = mt5.symbol_info_tick(SYMBOL)
-    if not tick: return None, None
-    live = {"bid": round(tick.bid, 2), "ask": round(tick.ask, 2)}
-    full_data = {}
-    for label, tf in tfs.items():
-        rates = mt5.copy_rates_from_pos(SYMBOL, tf, 1, CANDLE_COUNTS[label])
-        if rates is None: return None, None
-        full_data[label] = [
-            {"T": datetime.fromtimestamp(int(r[0]), tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
-             "O": round(r[1], 2), "H": round(r[2], 2), "L": round(r[3], 2), "C": round(r[4], 2), "V": int(r[5])}
-            for r in rates
-        ]
-    return full_data, live
+    try:
+        tfs = {"M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1}
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if not tick:
+            logging.error(f"Failed to get tick data for {SYMBOL}")
+            return None, None
+        live = {"bid": round(tick.bid, 2), "ask": round(tick.ask, 2)}
+        full_data = {}
+        for label, tf in tfs.items():
+            rates = mt5.copy_rates_from_pos(SYMBOL, tf, 1, CANDLE_COUNTS[label])
+            if rates is None:
+                logging.error(f"Failed to get rates for {SYMBOL} on {label}")
+                return None, None
+            full_data[label] = [
+                {"T": datetime.fromtimestamp(int(r[0]), tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
+                 "O": round(r[1], 2), "H": round(r[2], 2), "L": round(r[3], 2), "C": round(r[4], 2), "V": int(r[5])}
+                for r in rates
+            ]
+        return full_data, live
+    except Exception as e:
+        logging.error(f"Error in get_market_data_full: {e}")
+        return None, None
 
 # --- EXECUTION ---
 def execute_open(side, sl, tp):
-    tick = mt5.symbol_info_tick(SYMBOL)
-    m_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if m_type == mt5.ORDER_TYPE_BUY else tick.bid
-    request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": LOT_SIZE, "type": m_type, "price": price, "sl": sl, "tp": tp, "magic": 999, "comment": "AI Autonomous", "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_FOK}
-    mt5.order_send(request)
+    try:
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if not tick:
+            logging.error("Failed to get tick data for opening position")
+            return False
+
+        m_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+        price = tick.ask if m_type == mt5.ORDER_TYPE_BUY else tick.bid
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": LOT_SIZE,
+            "type": m_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "magic": 999,
+            "comment": "AI Autonomous",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logging.error(f"Order OPEN failed: {result.retcode} - {result.comment}")
+            send_telegram(f"❌ *Order OPEN Failed*\nSide: {side}\nError: {result.comment}")
+            return False
+
+        logging.info(f"Order OPEN success: Ticket={result.order}, Side={side}, SL={sl}, TP={tp}")
+        send_telegram(f"✅ *Order OPEN Success*\nTicket: {result.order}\nSide: {side}\nSL: {sl} | TP: {tp}")
+        return True
+    except Exception as e:
+        logging.error(f"Exception in execute_open: {e}")
+        return False
 
 def execute_close(ticket):
-    pos = mt5.positions_get(ticket=ticket)
-    if not pos: return
-    p = pos[0]; tick = mt5.symbol_info_tick(SYMBOL)
-    request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": SYMBOL, "volume": p.volume, "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY, "position": p.ticket, "price": tick.bid if p.type == 0 else tick.ask, "magic": 999, "type_filling": mt5.ORDER_FILLING_FOK}
-    mt5.order_send(request)
+    try:
+        pos = mt5.positions_get(ticket=ticket)
+        if not pos:
+            logging.warning(f"Position {ticket} not found for closing")
+            return False
+
+        p = pos[0]
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if not tick:
+            logging.error("Failed to get tick data for closing position")
+            return False
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SYMBOL,
+            "volume": p.volume,
+            "type": mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY,
+            "position": p.ticket,
+            "price": tick.bid if p.type == 0 else tick.ask,
+            "magic": 999,
+            "type_filling": mt5.ORDER_FILLING_FOK
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logging.error(f"Order CLOSE failed: {result.retcode} - {result.comment}")
+            send_telegram(f"❌ *Order CLOSE Failed*\nTicket: {ticket}\nError: {result.comment}")
+            return False
+
+        logging.info(f"Order CLOSE success: Ticket={ticket}, Profit={p.profit}")
+        send_telegram(f"✅ *Order CLOSE Success*\nTicket: {ticket}\nProfit: {p.profit:.2f}")
+        return True
+    except Exception as e:
+        logging.error(f"Exception in execute_close: {e}")
+        return False
 
 def execute_modify(ticket, sl, tp):
-    mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "symbol": SYMBOL, "position": ticket, "sl": sl, "tp": tp})
+    try:
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": SYMBOL,
+            "position": ticket,
+            "sl": sl,
+            "tp": tp
+        }
+
+        result = mt5.order_send(request)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logging.error(f"Order MODIFY failed: {result.retcode} - {result.comment}")
+            send_telegram(f"❌ *Order MODIFY Failed*\nTicket: {ticket}\nError: {result.comment}")
+            return False
+
+        logging.info(f"Order MODIFY success: Ticket={ticket}, New SL={sl}, New TP={tp}")
+        send_telegram(f"✅ *Order MODIFY Success*\nTicket: {ticket}\nNew SL: {sl} | New TP: {tp}")
+        return True
+    except Exception as e:
+        logging.error(f"Exception in execute_modify: {e}")
+        return False
+
+def validate_ai_response(decision, current_pos, live_price):
+    """Validate AI response before execution"""
+    try:
+        # Check required fields
+        if not isinstance(decision, dict):
+            logging.error("AI response is not a dictionary")
+            return False
+
+        action = str(decision.get("action", "")).upper()
+        side = str(decision.get("type", "")).upper()
+        sl = decision.get("sl", 0)
+        tp = decision.get("tp", 0)
+
+        # Validate action
+        valid_actions = ["OPEN", "WAIT", "MODIFY", "CLOSE", "HOLD", "COUNTER"]
+        if action not in valid_actions:
+            logging.error(f"Invalid action: {action}. Must be one of {valid_actions}")
+            return False
+
+        # Validate side
+        valid_sides = ["BUY", "SELL", "NONE"]
+        if side not in valid_sides:
+            logging.error(f"Invalid side: {side}. Must be one of {valid_sides}")
+            return False
+
+        # Validate SL/TP values
+        try:
+            sl = float(sl)
+            tp = float(tp)
+        except (ValueError, TypeError):
+            logging.error(f"Invalid SL/TP values: SL={sl}, TP={tp}")
+            return False
+
+        # Check SL/TP are reasonable (not negative or zero when required)
+        if action in ["OPEN", "MODIFY"]:
+            if sl < 0 or tp < 0:
+                logging.error(f"Negative SL/TP values: SL={sl}, TP={tp}")
+                return False
+
+            # Check SL/TP are not too far from current price (sanity check)
+            current_price = (live_price["bid"] + live_price["ask"]) / 2
+
+            if sl > 0:  # Only validate if SL is set
+                sl_distance = abs(current_price - sl)
+                if sl_distance > current_price * 0.1:  # More than 10% away
+                    logging.warning(f"SL too far from current price: {sl_distance} ({sl_distance/current_price*100:.1f}%)")
+
+            if tp > 0:  # Only validate if TP is set
+                tp_distance = abs(current_price - tp)
+                if tp_distance > current_price * 0.2:  # More than 20% away
+                    logging.warning(f"TP too far from current price: {tp_distance} ({tp_distance/current_price*100:.1f}%)")
+
+        # Validate logic: can't OPEN if position exists
+        if action == "OPEN" and current_pos:
+            logging.error("Cannot OPEN: position already exists")
+            return False
+
+        # Validate logic: can't CLOSE/MODIFY/COUNTER if no position
+        if action in ["CLOSE", "MODIFY", "COUNTER"] and not current_pos:
+            logging.error(f"Cannot {action}: no position exists")
+            return False
+
+        logging.info(f"AI response validated: Action={action}, Side={side}, SL={sl}, TP={tp}")
+        return True
+
+    except Exception as e:
+        logging.error(f"Exception in validate_ai_response: {e}")
+        return False
 
 # --- ENGINE ---
 def analyze_and_trade():
-    if not mt5.initialize(): return
+    if not mt5.initialize():
+        logging.error("Failed to initialize MT5")
+        return
+
+    logging.info(f"[{get_server_time_str()}] AUTONOMOUS ENGINE LOADED - {SYMBOL}")
     print(f"[{get_server_time_str()}] AUTONOMOUS ENGINE LOADED - {SYMBOL}", flush=True)
     next_run = time.time()
 
@@ -87,7 +262,9 @@ def analyze_and_trade():
             try:
                 next_run = current_time + CHECK_INTERVAL
                 market_data, live_price = get_market_data_full()
-                if not market_data: continue
+                if not market_data:
+                    logging.warning("Failed to get market data, skipping this cycle")
+                    continue
 
                 pos = mt5.positions_get(symbol=SYMBOL)
                 current_pos = None
@@ -100,7 +277,7 @@ def analyze_and_trade():
 
                 # PROMPT UNBURDENED (Broad Thinking)
                 prompt = f"""
-                You are an unburdened, high-level financial strategist. 
+                You are an unburdened, high-level financial strategist.
                 Your task is to manage trading decisions for {SYMBOL} with absolute autonomy.
                 Use your entire analytical knowledge base to interpret the provided data.
 
@@ -110,22 +287,39 @@ def analyze_and_trade():
                 - Your Current Position: {json.dumps(current_pos)}
 
                 GOAL:
-                Analyze the narrative across all timeframes. Decide the most logical next step to maximize profit and minimize risk. 
+                Analyze the narrative across all timeframes. Decide the most logical next step to maximize profit and minimize risk.
                 - If no position: Decide to OPEN or WAIT.
                 - If position active: Decide to MODIFY, CLOSE, HOLD, or COUNTER.
 
                 CONSTRAINT: Output JSON only. No explanation.
                 {{ "action": "{opsi_aksi}", "type": "BUY/SELL/NONE", "sl": 0.0, "tp": 0.0 }}
                 """
-                
+
                 response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
                 res_text = response.text.strip()
-                if "{" in res_text: res_text = res_text[res_text.find("{"):res_text.rfind("}")+1]
-                decision = json.loads(res_text)
-                
+
+                # Extract JSON from response
+                if "{" in res_text:
+                    res_text = res_text[res_text.find("{"):res_text.rfind("}")+1]
+
+                # Parse JSON
+                try:
+                    decision = json.loads(res_text)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse AI response as JSON: {e}")
+                    logging.error(f"AI response: {res_text}")
+                    continue
+
                 # Debugging (Overwrite)
-                with open("debug_prompt_ai.txt", mode="w", encoding="utf-8") as f: f.write(prompt)
-                
+                with open("debug_prompt_ai.txt", mode="w", encoding="utf-8") as f:
+                    f.write(prompt)
+
+                # Validate AI response before execution
+                if not validate_ai_response(decision, current_pos, live_price):
+                    logging.error("AI response validation failed, skipping execution")
+                    send_telegram(f"⚠️ *Validation Failed*\nAI decision rejected: {json.dumps(decision)}")
+                    continue
+
                 action = str(decision.get("action")).upper()
                 side = str(decision.get("type")).upper()
                 sl_p, tp_p = float(decision.get("sl", 0)), float(decision.get("tp", 0))
@@ -134,16 +328,24 @@ def analyze_and_trade():
                 send_telegram(f"🌐 *{SYMBOL} AUTONOMOUS*\nAction: {action}\nSide: {side}\nSL: {sl_p} | TP: {tp_p}")
                 add_summary_log(action, side, sl_p, tp_p)
 
+                # Execute actions based on validation
                 if not current_pos:
-                    if action == "OPEN" and side in ["BUY", "SELL"]: execute_open(side, sl_p, tp_p)
+                    if action == "OPEN" and side in ["BUY", "SELL"]:
+                        execute_open(side, sl_p, tp_p)
                 else:
-                    if action == "CLOSE": execute_close(current_pos['ticket'])
-                    elif action == "MODIFY": execute_modify(current_pos['ticket'], sl_p, tp_p)
-                    elif action == "COUNTER":
+                    if action == "CLOSE":
                         execute_close(current_pos['ticket'])
-                        execute_open("SELL" if current_pos['type'] == "BUY" else "BUY", sl_p, tp_p)
+                    elif action == "MODIFY":
+                        execute_modify(current_pos['ticket'], sl_p, tp_p)
+                    elif action == "COUNTER":
+                        if execute_close(current_pos['ticket']):
+                            time.sleep(1)  # Wait a bit before opening counter position
+                            execute_open("SELL" if current_pos['type'] == "BUY" else "BUY", sl_p, tp_p)
 
-            except Exception: pass
+            except json.JSONDecodeError as e:
+                logging.error(f"JSON parsing error: {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
         time.sleep(1)
 
 if __name__ == "__main__": analyze_and_trade()
